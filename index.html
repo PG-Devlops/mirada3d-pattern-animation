@@ -1,0 +1,322 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tri-star field</title>
+<style>
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: #fff;
+    overflow: hidden;
+  }
+  canvas {
+    display: block;
+    width: 100vw;
+    height: 100vh;
+    touch-action: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="field" aria-label="Tri-star pattern that thickens around the cursor"></canvas>
+
+<script>
+(() => {
+  // ---- Tunables -----------------------------------------------------------
+  const CONFIG = {
+    armLength: 30,     // px from a glyph's centre to each of its three tips
+    colGap: 54,        // horizontal distance between columns
+    rowGap: 58,        // vertical distance between glyphs in a column
+    thin: 0,           // resting centre bulge (fraction of armLength)
+    bold: 0.3,         // centre bulge directly under the cursor
+    thinStroke: 1.4,   // resting arm thickness in px
+    boldStroke: 7.5,   // arm thickness directly under the cursor
+
+    fieldShade: 205,   // grey of the surrounding pattern (0 = black, 255 = white)
+    logoShade: 134,    // grey of the glyphs that draw the logo
+
+    logoSize: 0.8,     // logo height as a fraction of the frame height
+    logoWeight: 0.7,   // how heavy glyphs inside the logo are (0 = thin, 1 = hover-heavy)
+    logoGap: 1.3,      // width of the gaps between the logo's panels, in columns
+
+    reach: 50,         // px; how far the pull spreads (gaussian sigma)
+    grow: 0.1,         // extra size at full pull (0.1 = 10% bigger)
+    pull: 0.28,        // how far glyphs lean toward the cursor (fraction of armLength)
+
+    // Spring feel. Lower "bounce" damping = more overshoot on the pop.
+    popStiffness: 420, // snap of a glyph being grabbed
+    popDamping: 0.34,  // 1 = no overshoot, lower = bouncier
+    restStiffness: 70, // how lazily a glyph lets go
+    restDamping: 0.85,
+    leanStiffness: 240,
+    leanDamping: 0.38,
+  };
+
+  // One knob for density: smaller = smaller glyphs, more of them on screen.
+  const SCALE = 0.45;
+  for (const key of ['armLength', 'colGap', 'rowGap', 'thinStroke', 'boldStroke']) {
+    CONFIG[key] *= SCALE;
+  }
+  CONFIG.thinStroke = Math.max(CONFIG.thinStroke, 0.75); // keep arms visible when tiny
+
+  // People who ask for reduced motion get the weight and colour change
+  // without the bounce or the lean.
+  if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+    CONFIG.popDamping = 1;
+    CONFIG.leanDamping = 1;
+    CONFIG.pull = 0;
+    CONFIG.grow = 0;
+  }
+
+  const canvas = document.getElementById('field');
+  const ctx = canvas.getContext('2d');
+
+  // Arm directions: straight up, lower right, lower left.
+  const DIRS = [-90, 30, 150].map((deg) => {
+    const a = (deg * Math.PI) / 180;
+    return [Math.cos(a), Math.sin(a)];
+  });
+
+  // Each glyph: home position (x, y), weight w with velocity vw,
+  // and a lean offset (ox, oy) with velocity (vx, vy).
+  let glyphs = [];
+  let width = 0;
+  let height = 0;
+  const pointer = { x: 0, y: 0, active: false };
+  let running = false;
+  let lastTime = 0;
+
+  function layout() {
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    width = window.innerWidth;
+    height = window.innerHeight;
+    canvas.width = Math.round(width * dpr);
+    canvas.height = Math.round(height * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    const { colGap, rowGap } = CONFIG;
+    const cols = Math.ceil(width / colGap) + 2;
+    const rows = Math.ceil(height / rowGap) + 2;
+
+    const logo = buildLogo();
+    glyphs = [];
+    for (let c = -1; c < cols; c++) {
+      // Every other column sits half a row lower, as in the reference.
+      const shift = (c & 1) ? rowGap / 2 : 0;
+      for (let r = -1; r < rows; r++) {
+        const x = c * colGap + colGap / 2;
+        const y = r * rowGap + shift + rowGap / 2;
+        const ink = logo(x, y);
+        glyphs.push({
+          x, y, ink,
+          base: ink * CONFIG.logoWeight, // resting weight: heavy inside the logo
+          w: 0, vw: 0,
+          ox: 0, oy: 0, vx: 0, vy: 0,
+        });
+      }
+    }
+    start();
+  }
+
+  // The logo: a triangle cut into three panels by a tri-star of gaps.
+  // Returns a function giving 0 (outside / in a gap) to 1 (well inside a panel).
+  function buildLogo() {
+    const ASPECT = 351 / 292;                 // logo width / height
+    const h = Math.min(height * CONFIG.logoSize, (width * 0.9) / ASPECT);
+    const w = h * ASPECT;
+    const x0 = (width - w) / 2;
+    const y0 = (height - h) / 2;
+    const A = [x0 + w / 2, y0];               // apex
+    const B = [x0, y0 + h];                   // bottom left
+    const C = [x0 + w, y0 + h];               // bottom right
+    const O = [x0 + w / 2, y0 + h * 0.668];   // where the three gaps meet
+    const gap = CONFIG.colGap * CONFIG.logoGap;
+    const soft = CONFIG.colGap * 0.5;         // edge softness
+
+    // Distance from the line PQ, positive on the side where O sits.
+    const edge = (P, Q) => {
+      const ex = Q[0] - P[0], ey = Q[1] - P[1];
+      const len = Math.hypot(ex, ey);
+      const sign = Math.sign(ex * (O[1] - P[1]) - ey * (O[0] - P[0])) || 1;
+      return (x, y) => (sign * (ex * (y - P[1]) - ey * (x - P[0]))) / len;
+    };
+    // Distance from the segment OP.
+    const spoke = (P) => {
+      const ex = P[0] - O[0], ey = P[1] - O[1];
+      const len2 = ex * ex + ey * ey;
+      return (x, y) => {
+        let t = ((x - O[0]) * ex + (y - O[1]) * ey) / len2;
+        t = Math.max(0, Math.min(1, t));
+        return Math.hypot(x - O[0] - ex * t, y - O[1] - ey * t);
+      };
+    };
+    const edges = [edge(A, B), edge(B, C), edge(C, A)];
+    const spokes = [spoke(A), spoke(B), spoke(C)];
+
+    return (x, y) => {
+      let m = Infinity;
+      for (const e of edges) m = Math.min(m, e(x, y));
+      for (const s of spokes) m = Math.min(m, s(x, y) - gap / 2);
+      const t = Math.max(0, Math.min(1, m / soft));
+      return t * t * (3 - 2 * t);
+    };
+  }
+
+  // Adds one glyph outline to the current path. `R` is the arm length and
+  // `k` is how far the curve between two tips bulges out from the centre.
+  function trace(x, y, R, k) {
+    ctx.moveTo(x + DIRS[0][0] * R, y + DIRS[0][1] * R);
+    for (let i = 0; i < 3; i++) {
+      const a = DIRS[i];
+      const b = DIRS[(i + 1) % 3];
+      ctx.bezierCurveTo(
+        x + a[0] * k, y + a[1] * k,
+        x + b[0] * k, y + b[1] * k,
+        x + b[0] * R, y + b[1] * R
+      );
+    }
+    ctx.closePath();
+  }
+
+  function shade(amount) {
+    const v = Math.round(CONFIG.fieldShade + (CONFIG.logoShade - CONFIG.fieldShade) * amount);
+    return 'rgb(' + v + ',' + v + ',' + v + ')';
+  }
+
+  function draw() {
+    const { armLength: R, thin, bold, thinStroke, boldStroke, grow } = CONFIG;
+    ctx.clearRect(0, 0, width, height);
+    ctx.lineJoin = 'round';
+
+    // Resting glyphs share one path; only the ones being pulled are drawn
+    // individually, because each needs its own weight, colour and position.
+    const lifted = [];
+    ctx.beginPath();
+    for (const g of glyphs) {
+      if (g.w > 0.003 || g.w < -0.003 || Math.abs(g.ox) > 0.05 || Math.abs(g.oy) > 0.05) {
+        lifted.push(g);
+      } else {
+        trace(g.x, g.y, R, R * thin);
+      }
+    }
+    const rest = shade(0);
+    ctx.fillStyle = rest;
+    ctx.strokeStyle = rest;
+    ctx.lineWidth = thinStroke;
+    ctx.fill();
+    ctx.stroke();
+
+    for (const g of lifted) {
+      // The spring overshoots past 1 on the pop; let size and weight follow
+      // it a little way so the bounce is visible, but keep colour in range.
+      const w = Math.max(0, Math.min(g.w, 1.35));
+      // Colour depends only on whether the glyph belongs to the logo,
+      // never on hover.
+      const tone = shade(g.ink);
+      const size = R * (1 + grow * w);
+      ctx.beginPath();
+      trace(g.x + g.ox, g.y + g.oy, size, size * (thin + (bold - thin) * w));
+      ctx.fillStyle = tone;
+      ctx.strokeStyle = tone;
+      ctx.lineWidth = thinStroke + (boldStroke - thinStroke) * w;
+      ctx.fill();
+      ctx.stroke();
+    }
+  }
+
+  function frame(now) {
+    const dt = Math.min((now - lastTime) / 1000, 1 / 30);
+    lastTime = now;
+
+    const C = CONFIG;
+    const inv = 1 / (C.reach * C.reach);
+    const pullPx = C.pull * C.armLength;
+    // Scales the lean so it peaks at exactly `pullPx`, on a ring around the cursor.
+    const leanNorm = Math.sqrt(2 * Math.E) / C.reach;
+    const leanDamp = 2 * Math.sqrt(C.leanStiffness) * C.leanDamping;
+    let moving = false;
+
+    for (const g of glyphs) {
+      let target = g.base;
+      let tx = 0;
+      let ty = 0;
+      if (pointer.active) {
+        const dx = pointer.x - g.x;
+        const dy = pointer.y - g.y;
+        const hover = Math.exp(-(dx * dx + dy * dy) * inv);
+        // The cursor adds on top of the logo's resting weight.
+        target = g.base + (1 - g.base) * hover;
+        // Lean toward the cursor: zero right under it, strongest on the
+        // surrounding ring, fading out beyond.
+        const lean = pullPx * leanNorm * hover;
+        tx = dx * lean;
+        ty = dy * lean;
+      }
+
+      // Weight spring: snappy and bouncy while grabbed, lazy when let go.
+      const stiff = C.restStiffness + (C.popStiffness - C.restStiffness) * target;
+      const zeta = C.restDamping + (C.popDamping - C.restDamping) * target;
+      g.vw += (stiff * (target - g.w) - 2 * Math.sqrt(stiff) * zeta * g.vw) * dt;
+      g.w += g.vw * dt;
+
+      // Lean spring.
+      g.vx += (C.leanStiffness * (tx - g.ox) - leanDamp * g.vx) * dt;
+      g.vy += (C.leanStiffness * (ty - g.oy) - leanDamp * g.vy) * dt;
+      g.ox += g.vx * dt;
+      g.oy += g.vy * dt;
+
+      const settled =
+        Math.abs(target - g.w) < 0.001 && Math.abs(g.vw) < 0.01 &&
+        Math.abs(tx - g.ox) < 0.02 && Math.abs(ty - g.oy) < 0.02 &&
+        Math.abs(g.vx) < 0.5 && Math.abs(g.vy) < 0.5;
+      if (settled) {
+        g.w = target; g.vw = 0;
+        g.ox = tx; g.oy = ty; g.vx = 0; g.vy = 0;
+      } else {
+        moving = true;
+      }
+    }
+
+    draw();
+
+    if (moving) {
+      requestAnimationFrame(frame);
+    } else {
+      running = false;
+    }
+  }
+
+  function start() {
+    if (running) return;
+    running = true;
+    lastTime = performance.now();
+    requestAnimationFrame(frame);
+  }
+
+  function track(e) {
+    pointer.x = e.clientX;
+    pointer.y = e.clientY;
+    pointer.active = true;
+    start();
+  }
+
+  function release() {
+    pointer.active = false;
+    start();
+  }
+
+  window.addEventListener('pointermove', track);
+  window.addEventListener('pointerdown', track);
+  window.addEventListener('pointerup', (e) => { if (e.pointerType !== 'mouse') release(); });
+  window.addEventListener('pointercancel', release);
+  document.documentElement.addEventListener('pointerleave', release);
+  window.addEventListener('blur', release);
+  window.addEventListener('resize', layout);
+
+  layout();
+})();
+</script>
+</body>
+</html>
