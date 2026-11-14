@@ -42,8 +42,15 @@
     logoGap: 1.3,      // width of the gaps between the logo's panels, in columns
 
     reach: 50,         // px; how far the pull spreads (gaussian sigma)
-    grow: 0.1,         // extra size at full pull (0.1 = 10% bigger)
-    pull: 0.28,        // how far glyphs lean toward the cursor (fraction of armLength)
+    grow: 0,           // (magnet experiment) extra size at full pull
+    pull: 0,           // (magnet experiment) lean toward the cursor; off in the 3D experiment
+    hoverWeight: 0.2,  // how much the cursor thickens a glyph (1 = as on main)
+
+    // 3D extrusion: hovered glyphs stay put and grow upward into pillars.
+    liftHeight: 2.2,   // pillar height at full hover, in arm lengths
+    wallFadeTop: 0.4,  // how washed-out the walls are just under the cap (0 = cap colour, 1 = white)
+    wallFadeBase: 0.88, // how washed-out they are down at the page
+    slant: -0.12,      // sideways lean of the viewing angle (0 = straight up)
 
     // Spring feel. Lower "bounce" damping = more overshoot on the pop.
     popStiffness: 420, // snap of a glyph being grabbed
@@ -82,6 +89,7 @@
   // Each glyph: home position (x, y), weight w with velocity vw,
   // and a lean offset (ox, oy) with velocity (vx, vy).
   let glyphs = [];
+  let dpr = 1;
   let width = 0;
   let height = 0;
   const pointer = { x: 0, y: 0, active: false };
@@ -89,7 +97,7 @@
   let lastTime = 0;
 
   function layout() {
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    dpr = Math.min(window.devicePixelRatio || 1, 2);
     width = window.innerWidth;
     height = window.innerHeight;
     canvas.width = Math.round(width * dpr);
@@ -113,6 +121,7 @@
           x, y, ink,
           base: ink * CONFIG.logoWeight, // resting weight: heavy inside the logo
           w: 0, vw: 0,
+          h: 0, vh: 0,   // lift height off the page, 0..1
           ox: 0, oy: 0, vx: 0, vy: 0,
         });
       }
@@ -180,8 +189,12 @@
     ctx.closePath();
   }
 
+  function shadeValue(amount) {
+    return Math.round(CONFIG.fieldShade + (CONFIG.logoShade - CONFIG.fieldShade) * amount);
+  }
+
   function shade(amount) {
-    const v = Math.round(CONFIG.fieldShade + (CONFIG.logoShade - CONFIG.fieldShade) * amount);
+    const v = shadeValue(amount);
     return 'rgb(' + v + ',' + v + ',' + v + ')';
   }
 
@@ -195,7 +208,8 @@
     const lifted = [];
     ctx.beginPath();
     for (const g of glyphs) {
-      if (g.w > 0.003 || g.w < -0.003 || Math.abs(g.ox) > 0.05 || Math.abs(g.oy) > 0.05) {
+      if (g.w > 0.003 || g.w < -0.003 || g.h > 0.003 || g.h < -0.003 ||
+          Math.abs(g.ox) > 0.05 || Math.abs(g.oy) > 0.05) {
         lifted.push(g);
       } else {
         trace(g.x, g.y, R, R * thin);
@@ -208,19 +222,57 @@
     ctx.fill();
     ctx.stroke();
 
+    // Extrusion: each glyph keeps its footprint on the page and grows upward
+    // into a pillar. The walls are the glyph stacked in a darker shade; the
+    // original-coloured glyph is the cap on top.
+    const { liftHeight, wallFadeTop, wallFadeBase, slant } = CONFIG;
+
+    // Glyphs lower on the screen stand in front, so draw top-to-bottom.
+    lifted.sort((a, b) => a.y - b.y);
+
     for (const g of lifted) {
-      // The spring overshoots past 1 on the pop; let size and weight follow
-      // it a little way so the bounce is visible, but keep colour in range.
+      // The spring overshoots past 1 on the pop; let the height and weight
+      // follow it a little way so the bounce is visible.
       const w = Math.max(0, Math.min(g.w, 1.35));
-      // Colour depends only on whether the glyph belongs to the logo,
-      // never on hover.
+      const h = Math.max(0, Math.min(g.h, 1.3));
+      const k = R * (thin + (bold - thin) * w);
+      const tall = R * liftHeight * h;
+      const x = g.x + g.ox;
+      const y = g.y + g.oy;
+      ctx.lineWidth = thinStroke + (boldStroke - thinStroke) * w;
+
+      if (tall > 0.4) {
+        // Walls are a washed-out tint of the glyph's own colour, palest at
+        // the page and deepening toward the cap. Drawn in a few bands so the
+        // fade is smooth without a draw call per layer.
+        const cap = shadeValue(g.ink);
+        const steps = Math.ceil(tall / 0.75);
+        const bands = Math.min(8, steps);
+        for (let b = 0; b < bands; b++) {
+          const t = bands > 1 ? b / (bands - 1) : 1;
+          const fade = wallFadeBase + (wallFadeTop - wallFadeBase) * t;
+          const v = Math.round(cap + (255 - cap) * fade);
+          const tone = 'rgb(' + v + ',' + v + ',' + v + ')';
+          ctx.beginPath();
+          const from = Math.floor((steps * b) / bands);
+          const to = Math.floor((steps * (b + 1)) / bands);
+          for (let i = from; i < to; i++) {
+            const z = (tall * i) / steps;
+            trace(x + z * slant, y - z, R, k);
+          }
+          ctx.fillStyle = tone;
+          ctx.strokeStyle = tone;
+          ctx.fill();
+          ctx.stroke();
+        }
+      }
+
+      // Cap: same colour as the glyph at rest, never changed by hover.
       const tone = shade(g.ink);
-      const size = R * (1 + grow * w);
       ctx.beginPath();
-      trace(g.x + g.ox, g.y + g.oy, size, size * (thin + (bold - thin) * w));
+      trace(x + tall * slant, y - tall, R, k);
       ctx.fillStyle = tone;
       ctx.strokeStyle = tone;
-      ctx.lineWidth = thinStroke + (boldStroke - thinStroke) * w;
       ctx.fill();
       ctx.stroke();
     }
@@ -240,6 +292,7 @@
 
     for (const g of glyphs) {
       let target = g.base;
+      let lift = 0;
       let tx = 0;
       let ty = 0;
       if (pointer.active) {
@@ -247,7 +300,8 @@
         const dy = pointer.y - g.y;
         const hover = Math.exp(-(dx * dx + dy * dy) * inv);
         // The cursor adds on top of the logo's resting weight.
-        target = g.base + (1 - g.base) * hover;
+        target = g.base + (1 - g.base) * hover * C.hoverWeight;
+        lift = hover;
         // Lean toward the cursor: zero right under it, strongest on the
         // surrounding ring, fading out beyond.
         const lean = pullPx * leanNorm * hover;
@@ -261,6 +315,12 @@
       g.vw += (stiff * (target - g.w) - 2 * Math.sqrt(stiff) * zeta * g.vw) * dt;
       g.w += g.vw * dt;
 
+      // Lift spring: same feel as the weight pop.
+      const lStiff = C.restStiffness + (C.popStiffness - C.restStiffness) * lift;
+      const lZeta = C.restDamping + (C.popDamping - C.restDamping) * lift;
+      g.vh += (lStiff * (lift - g.h) - 2 * Math.sqrt(lStiff) * lZeta * g.vh) * dt;
+      g.h += g.vh * dt;
+
       // Lean spring.
       g.vx += (C.leanStiffness * (tx - g.ox) - leanDamp * g.vx) * dt;
       g.vy += (C.leanStiffness * (ty - g.oy) - leanDamp * g.vy) * dt;
@@ -269,10 +329,12 @@
 
       const settled =
         Math.abs(target - g.w) < 0.001 && Math.abs(g.vw) < 0.01 &&
+        Math.abs(lift - g.h) < 0.001 && Math.abs(g.vh) < 0.01 &&
         Math.abs(tx - g.ox) < 0.02 && Math.abs(ty - g.oy) < 0.02 &&
         Math.abs(g.vx) < 0.5 && Math.abs(g.vy) < 0.5;
       if (settled) {
         g.w = target; g.vw = 0;
+        g.h = lift; g.vh = 0;
         g.ox = tx; g.oy = ty; g.vx = 0; g.vy = 0;
       } else {
         moving = true;
